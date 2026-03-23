@@ -1,0 +1,30 @@
+{
+  "name": "opencode-session-log",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "OpenCode plugin that writes human-readable and detailed session logs under .agents-log",
+  "exports": "./index.js",
+  "files": [
+    "index.js",
+    "README.md"
+  ],
+  "keywords": [
+    "opencode",
+    "plugin",
+    "session-log",
+    "agent-log",
+    "telemetry"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AndyKong2020/opencode-session-log.git"
+  },
+  "homepage": "https://github.com/AndyKong2020/opencode-session-log#readme",
+  "bugs": {
+    "url": "https://github.com/AndyKong2020/opencode-session-log/issues"
+  },
+  "license": "MIT",
+  "scripts": {
+    "test": "node --test tests/*.test.mjs"
+  }
+}
