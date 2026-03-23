@@ -117,13 +117,61 @@ async function buildSnapshotFromClient({ client, sessionID, directory }) {
     canUseClient && rootSessionID
       ? await collectSessionTree({ client, sessionID: rootSessionID, directory, seen: new Set() })
       : null;
-  if (snapshot?.session?.id) return snapshot;
+  const normalizedClientSnapshot = await normalizeSnapshotToRoot({
+    snapshot,
+    client,
+    directory,
+  });
+  if (normalizedClientSnapshot?.session?.id) return normalizedClientSnapshot;
   const exportedSnapshot = await buildSnapshotFromExport({
     sessionID: rootSessionID || sessionID,
     directory,
   });
-  if (exportedSnapshot?.session?.id) return exportedSnapshot;
+  const normalizedExportedSnapshot = await normalizeSnapshotToRoot({
+    snapshot: exportedSnapshot,
+    client,
+    directory,
+  });
+  if (normalizedExportedSnapshot?.session?.id) return normalizedExportedSnapshot;
   return buildSnapshotFromDatabase({ sessionID, directory });
+}
+
+async function normalizeSnapshotToRoot({ snapshot, client, directory }) {
+  if (!snapshot?.session?.id) return null;
+  if (!snapshot.session.parentID) return snapshot;
+
+  const canUseClient =
+    typeof client?.session?.get === "function" &&
+    typeof client?.session?.messages === "function";
+
+  let rootSessionID = null;
+  if (canUseClient) {
+    rootSessionID = await resolveRootSessionIDFromClient({
+      client,
+      sessionID: snapshot.session.parentID,
+      directory,
+    });
+  }
+  if (!rootSessionID) rootSessionID = snapshot.session.parentID;
+  if (!rootSessionID || rootSessionID === snapshot.session.id) return null;
+
+  if (canUseClient) {
+    const rebuilt = await collectSessionTree({
+      client,
+      sessionID: rootSessionID,
+      directory,
+      seen: new Set(),
+    });
+    if (rebuilt?.session?.id === rootSessionID) return rebuilt;
+  }
+
+  const rebuiltFromExport = await buildSnapshotFromExport({
+    sessionID: rootSessionID,
+    directory,
+  });
+  if (rebuiltFromExport?.session?.id === rootSessionID) return rebuiltFromExport;
+
+  return null;
 }
 
 async function resolveRootSessionIDFromClient({ client, sessionID, directory }) {
@@ -211,10 +259,22 @@ async function collectSessionTree({ client, sessionID, directory, seen }) {
 }
 
 async function buildSnapshotFromDatabase({ sessionID, directory }) {
-  const rootSessionID = await resolveRootSessionIDFromDb(sessionID);
+  let rootSessionID;
+  try {
+    rootSessionID = await resolveRootSessionIDFromDb(sessionID);
+  } catch (error) {
+    if (isMissingSessionTableError(error)) return null;
+    throw error;
+  }
   if (!rootSessionID) return null;
   const seen = new Set();
-  const snapshot = await collectSessionTreeFromDb(rootSessionID, seen);
+  let snapshot;
+  try {
+    snapshot = await collectSessionTreeFromDb(rootSessionID, seen);
+  } catch (error) {
+    if (isMissingSessionTableError(error)) return null;
+    throw error;
+  }
   if (!snapshot?.session?.id) return null;
   if (directory && !snapshot.session.directory) snapshot.session.directory = directory;
   snapshot.platform = "opencode";
@@ -512,6 +572,14 @@ async function querySqliteJson(sql) {
   return parseJsonValue(trimmed, []);
 }
 
+function isMissingSessionTableError(error) {
+  const stderr = String(error?.stderr || "");
+  const stdout = String(error?.stdout || "");
+  const stack = String(error?.stack || "");
+  const combined = `${stderr}\n${stdout}\n${stack}`;
+  return combined.includes("no such table: session");
+}
+
 let cachedSqlitePath = null;
 let cachedOpencodePath = null;
 
@@ -716,6 +784,27 @@ async function syncOpencodeSessionLogSnapshot({
     await fs.mkdir(summaryRoot, { recursive: true });
 
     const buckets = buildAgentBuckets(snapshot);
+    const preserveExistingChildren =
+      shouldPreserveExistingChildViews(state, buckets);
+    if (preserveExistingChildren) {
+      const globalIndexPath = await writeGlobalIndex(logRoot);
+      return {
+        sessionID: rootSession.id,
+        logRoot,
+        summaryPath: path.join(logRoot, state.summary_markdown_relpath),
+        usagePath: path.join(logRoot, state.usage_relpath),
+        statePath,
+        indexPath: globalIndexPath,
+        metaIndexPath: path.join(logRoot, state.markdown_relpath),
+        mergedMetaPath: path.join(logRoot, state.merged_markdown_relpath),
+        snapshotPath: path.join(
+          logRoot,
+          normalizeRelpath(
+            path.join(metaPaths.sessionDirRelpath, "artifacts", "shared", "snapshot.json"),
+          ),
+        ),
+      };
+    }
     const agentSummaryRelpaths = buildSummaryAgentRelpaths(summaryPaths.summaryDirRelpath, buckets);
     const agentMetaRelpaths = buildMetaAgentRelpaths(metaPaths.sessionDirRelpath, buckets);
     const agentOutputPaths = buildAgentOutputPaths(
@@ -1734,6 +1823,8 @@ function buildStatePayload({
     version: STATE_VERSION,
     platform: "opencode",
     session_id: rootSession.id,
+    root_session_id: rootSession.id,
+    parent_session_id: rootSession.parentID || null,
     title: rootSession.title,
     markdown_relpath: metaPaths.indexRelpath,
     merged_markdown_relpath: metaPaths.mergedRelpath,
@@ -1751,6 +1842,13 @@ function buildStatePayload({
     child_session_count: flattenSessionNodes(snapshot).length - 1,
     previous_version: oldState?.version,
   };
+}
+
+function shouldPreserveExistingChildViews(oldState, buckets) {
+  const previousAgents = Object.keys(oldState?.summary_agents_relpaths || {});
+  const currentChildCount = Math.max(0, buckets.length - 1);
+  const previousChildCount = previousAgents.filter((key) => key !== "main").length;
+  return previousChildCount > 0 && currentChildCount === 0;
 }
 
 function summarizeEntries(entries) {

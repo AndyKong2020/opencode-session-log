@@ -256,6 +256,12 @@ function makeSnapshot(workspace, overrides = {}) {
   };
 }
 
+function makeRootOnlySnapshot(workspace) {
+  const snapshot = makeSnapshot(workspace);
+  snapshot.children = [];
+  return snapshot;
+}
+
 function getOutputPaths(result) {
   const summaryRoot = path.dirname(result.summaryPath);
   const metaSessionDir = path.dirname(path.dirname(result.mergedMetaPath));
@@ -431,6 +437,36 @@ test("concurrent sync keeps a single summary directory", async () => {
   }
 });
 
+test("preserves child views when a later sync regresses to main-only", async () => {
+  const workspace = await mkdtemp(path.join(tmpdir(), "opencode-session-log-"));
+  try {
+    const first = await syncOpencodeSessionLogSnapshot({
+      projectDir: workspace,
+      snapshot: makeSnapshot(workspace),
+      triggerEvent: "message.updated",
+    });
+
+    const second = await syncOpencodeSessionLogSnapshot({
+      projectDir: workspace,
+      snapshot: makeRootOnlySnapshot(workspace),
+      triggerEvent: "session.updated",
+    });
+
+    const state = JSON.parse(await readText(second.statePath));
+    const rootSummary = await readText(second.summaryPath);
+
+    assert.equal(first.summaryPath, second.summaryPath);
+    assert.equal(state.child_session_count, 1);
+    assert.equal(
+      state.summary_agents_relpaths["ses_child"].summary_markdown_relpath,
+      "summary/2026-03-19_11-23-11/agents/ses_child/summary.md",
+    );
+    assert.equal(rootSummary.includes("ses_child"), true);
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
 test("parses legacy sqlite tabular output and detects -json fallback", () => {
   const rows = parseSqliteTabularJson(
     [
@@ -538,6 +574,59 @@ test("buildSnapshotFromClient resolves child session back to root session", asyn
   }
 });
 
+test("buildSnapshotFromClient repairs root resolution when initial child lookup misses parentID", async () => {
+  const workspace = await mkdtemp(path.join(tmpdir(), "opencode-session-log-"));
+  try {
+    const snapshot = makeSnapshot(workspace);
+    const childWithoutParent = {
+      ...snapshot.children[0].session,
+      parentID: undefined,
+    };
+    const childWithParent = snapshot.children[0].session;
+    let childGetCalls = 0;
+
+    const client = {
+      session: {
+        get: ({ sessionID }) => {
+          if (sessionID === snapshot.children[0].session.id) {
+            childGetCalls += 1;
+            return childGetCalls === 1 ? childWithoutParent : childWithParent;
+          }
+          if (sessionID === snapshot.session.id) return snapshot.session;
+          return null;
+        },
+        messages: ({ sessionID }) => {
+          if (sessionID === snapshot.session.id) return snapshot.messages;
+          if (sessionID === snapshot.children[0].session.id) return snapshot.children[0].messages;
+          return [];
+        },
+        todo: () => [],
+        diff: ({ sessionID }) => {
+          if (sessionID === snapshot.session.id) return snapshot.session.summary?.diffs || [];
+          if (sessionID === snapshot.children[0].session.id) return snapshot.children[0].session.summary?.diffs || [];
+          return [];
+        },
+        children: ({ sessionID }) => {
+          if (sessionID === snapshot.session.id) return [snapshot.children[0].session];
+          return [];
+        },
+      },
+    };
+
+    const built = await buildSnapshotFromClient({
+      client,
+      sessionID: snapshot.children[0].session.id,
+      directory: workspace,
+    });
+
+    assert.equal(built.session.id, "ses_root");
+    assert.equal(built.children.length, 1);
+    assert.equal(built.children[0].session.id, "ses_child");
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
 test("normalizes exported parent-child sessions into a single root tree", () => {
   const root = normalizeExportedSnapshot(
     {
@@ -560,4 +649,21 @@ test("normalizes exported parent-child sessions into a single root tree", () => 
 
   assert.equal(root.session.id, "ses_root");
   assert.equal(root.children[0].session.id, "ses_child");
+});
+
+test("state payload records root and parent session identifiers", async () => {
+  const workspace = await mkdtemp(path.join(tmpdir(), "opencode-session-log-"));
+  try {
+    const result = await syncOpencodeSessionLogSnapshot({
+      projectDir: workspace,
+      snapshot: makeSnapshot(workspace),
+      triggerEvent: "message.updated",
+    });
+
+    const state = JSON.parse(await readText(result.statePath));
+    assert.equal(state.root_session_id, "ses_root");
+    assert.equal(state.parent_session_id, null);
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
 });
