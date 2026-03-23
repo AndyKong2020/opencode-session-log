@@ -7,6 +7,8 @@ import test from "node:test";
 import OpencodeSessionLogPlugin from "../index.js";
 
 const { syncOpencodeSessionLogSnapshot } = OpencodeSessionLogPlugin;
+const { parseSqliteTabularJson, shouldFallbackSqliteFormat, parseOpencodeExport, normalizeExportedSnapshot } =
+  OpencodeSessionLogPlugin.__testOnly();
 
 function makeSnapshot(workspace, overrides = {}) {
   const longToolOutput = overrides.longToolOutput ?? null;
@@ -424,4 +426,73 @@ test("concurrent sync keeps a single summary directory", async () => {
   } finally {
     await rm(workspace, { recursive: true, force: true });
   }
+});
+
+test("parses legacy sqlite tabular output and detects -json fallback", () => {
+  const rows = parseSqliteTabularJson(
+    [
+      "id\tparentID\ttimeCreated\tdata",
+      'ses_root\tnull\t1773890591755\t{"role":"assistant","count":2}',
+      "ses_child\tses_root\t1773890600000\tplain-text",
+    ].join("\n"),
+  );
+
+  assert.deepEqual(rows, [
+    {
+      id: "ses_root",
+      parentID: null,
+      timeCreated: 1773890591755,
+      data: { role: "assistant", count: 2 },
+    },
+    {
+      id: "ses_child",
+      parentID: "ses_root",
+      timeCreated: 1773890600000,
+      data: "plain-text",
+    },
+  ]);
+
+  assert.equal(
+    shouldFallbackSqliteFormat({
+      stderr: "sqlite3: Error: unknown option: -json\nUse -help for a list of options.\n",
+    }),
+    true,
+  );
+  assert.equal(shouldFallbackSqliteFormat({ stderr: "another error" }), false);
+});
+
+test("parses opencode export output with human prefix", () => {
+  const exported = parseOpencodeExport(
+    'Exporting session: ses_123{"info":{"id":"ses_123","directory":"/tmp/demo"},"messages":[]}',
+  );
+
+  assert.deepEqual(exported, {
+    info: { id: "ses_123", directory: "/tmp/demo" },
+    messages: [],
+  });
+});
+
+test("normalizes exported snapshot into plugin snapshot shape", () => {
+  const snapshot = normalizeExportedSnapshot(
+    {
+      info: {
+        id: "ses_root",
+        directory: "/tmp/demo",
+        summary: { diffs: [{ path: "a.txt" }] },
+      },
+      messages: [{ info: { id: "msg_1" }, parts: [] }],
+      children: [
+        {
+          info: { id: "ses_child" },
+          messages: [],
+        },
+      ],
+    },
+    "/tmp/demo",
+  );
+
+  assert.equal(snapshot.platform, "opencode");
+  assert.equal(snapshot.session.id, "ses_root");
+  assert.deepEqual(snapshot.diff, [{ path: "a.txt" }]);
+  assert.equal(snapshot.children[0].session.id, "ses_child");
 });

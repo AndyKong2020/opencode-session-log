@@ -42,37 +42,52 @@ const DEBOUNCED_EVENT_TYPES = new Set([
 async function OpencodeSessionLogPlugin(input) {
   const pending = new Map();
 
+  const runSync = async (sessionID, state) => {
+    try {
+      const snapshot = await buildSnapshotFromClient({
+        client: input.client,
+        sessionID,
+        directory: input.directory,
+      });
+      if (!snapshot) return;
+      await syncOpencodeSessionLogSnapshot({
+        projectDir: input.directory,
+        snapshot,
+        triggerEvent: state.triggerEvent,
+      });
+    } catch (error) {
+      await writePluginError(path.resolve(input.directory, LOG_DIRNAME), error);
+    } finally {
+      const current = pending.get(sessionID);
+      if (current === state) pending.delete(sessionID);
+    }
+  };
+
   const queueSync = (sessionID, triggerEvent, immediate = false) => {
     if (!sessionID) return;
     const existing = pending.get(sessionID);
     if (existing) {
-      clearTimeout(existing.timer);
+      if (existing.timer) clearTimeout(existing.timer);
       existing.triggerEvent = triggerEvent;
       if (immediate) existing.immediate = true;
+      if (existing.promise && existing.immediate) return existing.promise;
     }
 
     const state = existing ?? { triggerEvent, immediate };
     state.triggerEvent = triggerEvent;
     state.immediate = state.immediate || immediate;
-    state.timer = setTimeout(async () => {
-      pending.delete(sessionID);
-      try {
-        const snapshot = await buildSnapshotFromClient({
-          client: input.client,
-          sessionID,
-          directory: input.directory,
-        });
-        if (!snapshot) return;
-        await syncOpencodeSessionLogSnapshot({
-          projectDir: input.directory,
-          snapshot,
-          triggerEvent: state.triggerEvent,
-        });
-      } catch (error) {
-        await writePluginError(path.resolve(input.directory, LOG_DIRNAME), error);
-      }
-    }, state.immediate ? 0 : 150);
+    state.timer = null;
+    state.promise = null;
+    if (state.immediate) {
+      state.promise = runSync(sessionID, state);
+      pending.set(sessionID, state);
+      return state.promise;
+    }
+    state.timer = setTimeout(() => {
+      state.promise = runSync(sessionID, state);
+    }, 150);
     pending.set(sessionID, state);
+    return Promise.resolve();
   };
 
   return {
@@ -80,13 +95,13 @@ async function OpencodeSessionLogPlugin(input) {
       if (!event || !RELEVANT_EVENT_TYPES.has(event.type)) return;
       const sessionID = extractSessionID(event);
       if (!sessionID) return;
-      queueSync(sessionID, event.type, !DEBOUNCED_EVENT_TYPES.has(event.type));
+      return queueSync(sessionID, event.type, !DEBOUNCED_EVENT_TYPES.has(event.type));
     },
     "tool.execute.after": async (hookInput) => {
-      queueSync(hookInput.sessionID, "tool.execute.after", true);
+      return queueSync(hookInput.sessionID, "tool.execute.after", true);
     },
     "experimental.session.compacting": async (hookInput) => {
-      queueSync(hookInput.sessionID, "experimental.session.compacting", true);
+      return queueSync(hookInput.sessionID, "experimental.session.compacting", true);
     },
   };
 }
@@ -99,6 +114,8 @@ async function buildSnapshotFromClient({ client, sessionID, directory }) {
     ? await collectSessionTree({ client, sessionID, directory, seen: new Set() })
     : null;
   if (snapshot?.session?.id) return snapshot;
+  const exportedSnapshot = await buildSnapshotFromExport({ sessionID, directory });
+  if (exportedSnapshot?.session?.id) return exportedSnapshot;
   return buildSnapshotFromDatabase({ sessionID, directory });
 }
 
@@ -176,6 +193,47 @@ async function buildSnapshotFromDatabase({ sessionID, directory }) {
   snapshot.platform = "opencode";
   snapshot.capturedAt = Date.now();
   return snapshot;
+}
+
+async function buildSnapshotFromExport({ sessionID, directory }) {
+  if (!sessionID) return null;
+  const opencodePath = await resolveOpencodePath();
+  let stdout;
+  try {
+    ({ stdout } = await execFile(opencodePath, ["export", sessionID], {
+      cwd: directory || process.cwd(),
+    }));
+  } catch {
+    return null;
+  }
+
+  const exported = parseOpencodeExport(String(stdout || ""));
+  if (!exported?.info?.id) return null;
+  return normalizeExportedSnapshot(exported, directory);
+}
+
+function parseOpencodeExport(raw) {
+  const text = String(raw || "").trim();
+  if (!text) return null;
+  const start = text.indexOf("{");
+  if (start < 0) return null;
+  return parseJsonValue(text.slice(start), null);
+}
+
+function normalizeExportedSnapshot(exported, directory) {
+  const session = { ...(exported.info || {}) };
+  if (directory && !session.directory) session.directory = directory;
+  return {
+    platform: "opencode",
+    capturedAt: Date.now(),
+    session,
+    messages: safeArray(exported.messages),
+    todos: safeArray(exported.todos),
+    diff: safeArray(exported.diff ?? exported.info?.summary?.diffs),
+    children: safeArray(exported.children).map((child) =>
+      normalizeExportedSnapshot(child, directory),
+    ),
+  };
 }
 
 async function collectSessionTreeFromDb(sessionID, seen) {
@@ -370,10 +428,148 @@ async function loadMessagesFromDb(sessionID) {
 
 async function querySqliteJson(sql) {
   const dbPath = path.join(os.homedir(), ".local", "share", "opencode", "opencode.db");
-  const { stdout } = await execFile("sqlite3", ["-json", dbPath, ".timeout 3000", sql]);
+  const sqlitePath = await resolveSqlitePath();
+  let stdout;
+  try {
+    ({ stdout } = await execFile(sqlitePath, ["-json", dbPath, ".timeout 3000", sql]));
+  } catch (error) {
+    if (!shouldFallbackSqliteFormat(error)) throw error;
+    ({ stdout } = await execFile(sqlitePath, [
+      "-header",
+      "-separator",
+      "\t",
+      dbPath,
+      ".timeout 3000",
+      sql,
+    ]));
+    return parseSqliteTabularJson(String(stdout || ""));
+  }
   const trimmed = String(stdout || "").trim();
   if (!trimmed) return [];
   return parseJsonValue(trimmed, []);
+}
+
+let cachedSqlitePath = null;
+let cachedOpencodePath = null;
+
+async function resolveSqlitePath() {
+  if (cachedSqlitePath) return cachedSqlitePath;
+  const candidates = [
+    process.env.SQLITE3_BIN,
+    "sqlite3",
+    "/usr/local/sqlite3/bin/sqlite3",
+    "/opt/homebrew/bin/sqlite3",
+    "/usr/bin/sqlite3",
+    "/bin/sqlite3",
+  ].filter(Boolean);
+
+  for (const candidate of candidates) {
+    try {
+      await execFile(candidate, ["-version"]);
+      cachedSqlitePath = candidate;
+      return candidate;
+    } catch {
+      continue;
+    }
+  }
+
+  cachedSqlitePath = "sqlite3";
+  return cachedSqlitePath;
+}
+
+async function resolveOpencodePath() {
+  if (cachedOpencodePath) return cachedOpencodePath;
+  const candidates = [
+    process.env.OPENCODE_BIN,
+    "opencode",
+    path.join(os.homedir(), ".opencode", "bin", "opencode"),
+    path.join(os.homedir(), ".local", "bin", "opencode"),
+  ].filter(Boolean);
+
+  for (const candidate of candidates) {
+    try {
+      await execFile(candidate, ["--version"]);
+      cachedOpencodePath = candidate;
+      return candidate;
+    } catch {
+      continue;
+    }
+  }
+
+  cachedOpencodePath = "opencode";
+  return cachedOpencodePath;
+}
+
+function shouldFallbackSqliteFormat(error) {
+  const stderr = String(error?.stderr || "");
+  const stdout = String(error?.stdout || "");
+  const combined = `${stderr}\n${stdout}`;
+  return (
+    combined.includes("unknown option: -json") ||
+    combined.includes("Error: unknown option: -json")
+  );
+}
+
+function parseSqliteTabularJson(raw) {
+  const lines = String(raw || "")
+    .split(/\r?\n/)
+    .map((line) => line.trimEnd())
+    .filter(Boolean);
+  if (!lines.length) return [];
+  const headers = lines[0].split("\t");
+  const rows = [];
+  for (const line of lines.slice(1)) {
+    const cells = line.split("\t");
+    const record = {};
+    for (let index = 0; index < headers.length; index += 1) {
+      record[headers[index]] = parseSqliteCell(cells[index] ?? "");
+    }
+    rows.push(record);
+  }
+  return rows;
+}
+
+function resetSqlitePathCache() {
+  cachedSqlitePath = null;
+  cachedOpencodePath = null;
+}
+
+function setSqlitePathForTesting(value) {
+  cachedSqlitePath = value || null;
+}
+
+function getSqlitePathForTesting() {
+  return cachedSqlitePath;
+}
+
+function __testOnly() {
+  return {
+    parseOpencodeExport,
+    normalizeExportedSnapshot,
+    parseSqliteTabularJson,
+    shouldFallbackSqliteFormat,
+    resetSqlitePathCache,
+    setSqlitePathForTesting,
+    getSqlitePathForTesting,
+  };
+}
+
+function parseSqliteCell(value) {
+  if (value == null || value === "") return "";
+  const parsed = parseJsonValue(value, undefined);
+  if (parsed !== undefined) return parsed;
+  if (value === "null") return null;
+  if (value === "true") return true;
+  if (value === "false") return false;
+  if (/^-?\d+$/.test(value)) {
+    const numeric = Number(value);
+    if (Number.isSafeInteger(numeric)) return numeric;
+  }
+  if (/^-?\d+\.\d+$/.test(value)) {
+    const numeric = Number(value);
+    if (!Number.isNaN(numeric)) return numeric;
+  }
+  return value;
 }
 
 function sqlString(value) {
@@ -2123,4 +2319,5 @@ const pluginDir = path.dirname(fileURLToPath(import.meta.url));
 OpencodeSessionLogPlugin.buildSnapshotFromClient = buildSnapshotFromClient;
 OpencodeSessionLogPlugin.syncOpencodeSessionLogSnapshot = syncOpencodeSessionLogSnapshot;
 OpencodeSessionLogPlugin.OPENCODE_SESSION_LOG_PLUGIN_DIR = pluginDir;
+OpencodeSessionLogPlugin.__testOnly = __testOnly;
 export default OpencodeSessionLogPlugin;
