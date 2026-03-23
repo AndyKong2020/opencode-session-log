@@ -110,13 +110,40 @@ async function buildSnapshotFromClient({ client, sessionID, directory }) {
   const canUseClient =
     typeof client?.session?.get === "function" &&
     typeof client?.session?.messages === "function";
-  const snapshot = canUseClient
-    ? await collectSessionTree({ client, sessionID, directory, seen: new Set() })
+  const rootSessionID = canUseClient
+    ? await resolveRootSessionIDFromClient({ client, sessionID, directory })
     : null;
+  const snapshot =
+    canUseClient && rootSessionID
+      ? await collectSessionTree({ client, sessionID: rootSessionID, directory, seen: new Set() })
+      : null;
   if (snapshot?.session?.id) return snapshot;
-  const exportedSnapshot = await buildSnapshotFromExport({ sessionID, directory });
+  const exportedSnapshot = await buildSnapshotFromExport({
+    sessionID: rootSessionID || sessionID,
+    directory,
+  });
   if (exportedSnapshot?.session?.id) return exportedSnapshot;
   return buildSnapshotFromDatabase({ sessionID, directory });
+}
+
+async function resolveRootSessionIDFromClient({ client, sessionID, directory }) {
+  let currentID = sessionID;
+  const visited = new Set();
+
+  while (currentID && !visited.has(currentID)) {
+    visited.add(currentID);
+    const session = await fetchData(
+      client.session.get(
+        { sessionID: currentID, directory },
+        { responseStyle: "data" },
+      ),
+    );
+    if (!session?.id) return null;
+    if (!session.parentID) return session.id;
+    currentID = session.parentID;
+  }
+
+  return currentID || null;
 }
 
 async function collectSessionTree({ client, sessionID, directory, seen }) {
@@ -197,6 +224,42 @@ async function buildSnapshotFromDatabase({ sessionID, directory }) {
 
 async function buildSnapshotFromExport({ sessionID, directory }) {
   if (!sessionID) return null;
+  const exportedByID = new Map();
+  let currentID = sessionID;
+  let current = await exportSessionByID({ sessionID: currentID, directory });
+  if (!current?.info?.id) return null;
+  exportedByID.set(current.info.id, current);
+
+  while (current?.info?.parentID && !exportedByID.has(current.info.parentID)) {
+    currentID = current.info.parentID;
+    current = await exportSessionByID({ sessionID: currentID, directory });
+    if (!current?.info?.id) break;
+    exportedByID.set(current.info.id, current);
+  }
+
+  const rootID = current?.info?.id || sessionID;
+  const normalizedByID = new Map();
+  for (const [id, exported] of exportedByID.entries()) {
+    normalizedByID.set(id, normalizeExportedSnapshot(exported, directory));
+  }
+
+  for (const snapshot of normalizedByID.values()) {
+    snapshot.children = [];
+  }
+  for (const [id, exported] of exportedByID.entries()) {
+    const parentID = exported?.info?.parentID;
+    if (!parentID) continue;
+    const parent = normalizedByID.get(parentID);
+    const child = normalizedByID.get(id);
+    if (parent && child && !parent.children.some((entry) => entry.session?.id === child.session?.id)) {
+      parent.children.push(child);
+    }
+  }
+
+  return normalizedByID.get(rootID) || null;
+}
+
+async function exportSessionByID({ sessionID, directory }) {
   const opencodePath = await resolveOpencodePath();
   let stdout;
   try {
@@ -209,7 +272,7 @@ async function buildSnapshotFromExport({ sessionID, directory }) {
 
   const exported = parseOpencodeExport(String(stdout || ""));
   if (!exported?.info?.id) return null;
-  return normalizeExportedSnapshot(exported, directory);
+  return exported;
 }
 
 function parseOpencodeExport(raw) {
@@ -544,6 +607,7 @@ function getSqlitePathForTesting() {
 
 function __testOnly() {
   return {
+    exportSessionByID,
     parseOpencodeExport,
     normalizeExportedSnapshot,
     parseSqliteTabularJson,
@@ -838,7 +902,7 @@ function buildAgentBuckets(snapshot) {
         kind: "subagent",
         label,
         rawID: node.session.id,
-        keySeed: node.session.slug || label || node.session.id,
+        keySeed: node.session.id,
         session: node.session,
         messages: node.messages,
         usedKeys,

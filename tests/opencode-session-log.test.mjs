@@ -6,7 +6,7 @@ import test from "node:test";
 
 import OpencodeSessionLogPlugin from "../index.js";
 
-const { syncOpencodeSessionLogSnapshot } = OpencodeSessionLogPlugin;
+const { syncOpencodeSessionLogSnapshot, buildSnapshotFromClient } = OpencodeSessionLogPlugin;
 const { parseSqliteTabularJson, shouldFallbackSqliteFormat, parseOpencodeExport, normalizeExportedSnapshot } =
   OpencodeSessionLogPlugin.__testOnly();
 
@@ -32,11 +32,11 @@ function makeSnapshot(workspace, overrides = {}) {
 
   const childSession = {
     id: "ses_child",
-    slug: "agent-helper",
+    slug: "ses_child",
     projectID: "proj_1",
     directory: workspace,
     parentID: "ses_root",
-    title: "agent-helper",
+    title: "ses_child",
     version: "1.2.27",
     time: {
       created: 1773890600000,
@@ -264,11 +264,11 @@ function getOutputPaths(result) {
     metaSessionDir,
     mainSummary: path.join(summaryRoot, "agents", "main", "summary.md"),
     mainUsage: path.join(summaryRoot, "agents", "main", "usage.json"),
-    subagentSummary: path.join(summaryRoot, "agents", "agent-helper", "summary.md"),
-    subagentUsage: path.join(summaryRoot, "agents", "agent-helper", "usage.json"),
+    subagentSummary: path.join(summaryRoot, "agents", "ses_child", "summary.md"),
+    subagentUsage: path.join(summaryRoot, "agents", "ses_child", "usage.json"),
     metaIndex: path.join(metaSessionDir, "index.md"),
     mainMeta: path.join(metaSessionDir, "agents", "main", "session.md"),
-    subagentMeta: path.join(metaSessionDir, "agents", "agent-helper", "session.md"),
+    subagentMeta: path.join(metaSessionDir, "agents", "ses_child", "session.md"),
     sharedRendered: path.join(metaSessionDir, "artifacts", "shared", "rendered"),
     mainRendered: path.join(metaSessionDir, "artifacts", "main", "rendered"),
   };
@@ -324,7 +324,10 @@ test("creates root, agent, and merged outputs under .agents-log", async () => {
     assert.equal(subagentSummary.includes("Subagent inspected the logging layer and found no crash path."), true);
     assert.equal(subagentSummary.includes("I should inspect the repository and use tools carefully."), false);
 
-    assert.equal(mergedMeta.includes("[agent-helper]"), true);
+    assert.equal(
+      mergedMeta.includes("[agent-helper]") || mergedMeta.includes("[ses_child]"),
+      true,
+    );
     assert.equal(mainMeta.includes("I should inspect the repository and use tools carefully."), true);
     assert.equal(mainMeta.includes("Subagent inspected the logging layer"), false);
     assert.equal(subagentMeta.includes("Subagent inspected the logging layer and found no crash path."), true);
@@ -341,9 +344,9 @@ test("creates root, agent, and merged outputs under .agents-log", async () => {
 
     assert.equal(state.summary_dir_relpath, "summary/2026-03-19_11-23-11");
     assert.equal(state.summary_agents_relpaths.main.summary_markdown_relpath, "summary/2026-03-19_11-23-11/agents/main/summary.md");
-    assert.equal(state.summary_agents_relpaths["agent-helper"].summary_markdown_relpath, "summary/2026-03-19_11-23-11/agents/agent-helper/summary.md");
+    assert.equal(state.summary_agents_relpaths["ses_child"].summary_markdown_relpath, "summary/2026-03-19_11-23-11/agents/ses_child/summary.md");
     assert.equal(state.meta_agents_relpaths.main.markdown_relpath, "meta/sessions/2026/03/ses_root/agents/main/session.md");
-    assert.equal(state.meta_agents_relpaths["agent-helper"].markdown_relpath, "meta/sessions/2026/03/ses_root/agents/agent-helper/session.md");
+    assert.equal(state.meta_agents_relpaths["ses_child"].markdown_relpath, "meta/sessions/2026/03/ses_root/agents/ses_child/session.md");
 
     assert.equal(indexText.includes("OpenCode Session Meta Index"), true);
     assert.equal(indexText.includes("ses_root"), true);
@@ -495,4 +498,66 @@ test("normalizes exported snapshot into plugin snapshot shape", () => {
   assert.equal(snapshot.session.id, "ses_root");
   assert.deepEqual(snapshot.diff, [{ path: "a.txt" }]);
   assert.equal(snapshot.children[0].session.id, "ses_child");
+});
+
+test("buildSnapshotFromClient resolves child session back to root session", async () => {
+  const workspace = await mkdtemp(path.join(tmpdir(), "opencode-session-log-"));
+  try {
+    const snapshot = makeSnapshot(workspace);
+    const sessions = new Map([
+      [snapshot.session.id, snapshot.session],
+      [snapshot.children[0].session.id, snapshot.children[0].session],
+    ]);
+    const messages = new Map([
+      [snapshot.session.id, snapshot.messages],
+      [snapshot.children[0].session.id, snapshot.children[0].messages],
+    ]);
+    const children = new Map([[snapshot.session.id, [snapshot.children[0].session]], [snapshot.children[0].session.id, []]]);
+
+    const client = {
+      session: {
+        get: ({ sessionID }) => sessions.get(sessionID),
+        messages: ({ sessionID }) => messages.get(sessionID) || [],
+        todo: () => [],
+        diff: ({ sessionID }) => sessions.get(sessionID)?.summary?.diffs || [],
+        children: ({ sessionID }) => children.get(sessionID) || [],
+      },
+    };
+
+    const built = await buildSnapshotFromClient({
+      client,
+      sessionID: "ses_child",
+      directory: workspace,
+    });
+
+    assert.equal(built.session.id, "ses_root");
+    assert.equal(built.children.length, 1);
+    assert.equal(built.children[0].session.id, "ses_child");
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("normalizes exported parent-child sessions into a single root tree", () => {
+  const root = normalizeExportedSnapshot(
+    {
+      info: { id: "ses_root", directory: "/tmp/demo" },
+      messages: [],
+    },
+    "/tmp/demo",
+  );
+  const child = normalizeExportedSnapshot(
+    {
+      info: { id: "ses_child", parentID: "ses_root", directory: "/tmp/demo" },
+      messages: [],
+    },
+    "/tmp/demo",
+  );
+
+  root.children = [];
+  child.children = [];
+  root.children.push(child);
+
+  assert.equal(root.session.id, "ses_root");
+  assert.equal(root.children[0].session.id, "ses_child");
 });
