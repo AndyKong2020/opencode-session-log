@@ -1,6 +1,6 @@
 {
   "name": "opencode-session-log",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "type": "module",
   "description": "OpenCode plugin that writes human-readable and detailed session logs under .agents-log",
   "exports": "./index.js",

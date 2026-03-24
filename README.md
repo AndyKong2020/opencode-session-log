@@ -46,6 +46,44 @@ Global config:
 
 - `~/.config/opencode/opencode.json`
 
+## Automated npm Publishing
+
+This repo is configured to publish from GitHub Actions. You do not need your own server.
+
+The publish workflow runs when you push a tag like:
+
+```bash
+git tag v0.1.6
+git push origin v0.1.6
+```
+
+Before the publish step, GitHub Actions will:
+
+- install dependencies
+- run `npm test`
+- verify that the tag version matches `package.json`
+
+### One-time GitHub setup
+
+Add this repository secret:
+
+- `NPM_TOKEN`
+
+The token should be an npm publish token with permission to publish this package. If your npm account enforces 2FA for publishing, use a token that supports publish without interactive OTP.
+
+### Release flow
+
+1. Update `package.json` version
+2. Commit and push `main`
+3. Create and push a matching tag:
+
+```bash
+git tag v0.1.6
+git push origin main --tags
+```
+
+GitHub Actions will publish that exact version to npm.
+
 ## What It Captures
 
 - Session-level summary and usage
