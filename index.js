@@ -14,6 +14,7 @@ const SUMMARY_TEXT_INLINE_LIMIT = 4000;
 const SUMMARY_VALUE_INLINE_LIMIT = 1200;
 const LOCK_TIMEOUT_MS = 30000;
 const LOCK_RETRY_MS = 80;
+const LARGE_OUTPUT_MAX_BUFFER = 64 * 1024 * 1024;
 const execFile = promisify(execFileCallback);
 
 const RELEVANT_EVENT_TYPES = new Set([
@@ -324,6 +325,7 @@ async function exportSessionByID({ sessionID, directory }) {
   let stdout;
   try {
     ({ stdout } = await execFile(opencodePath, ["export", sessionID], {
+      ...largeOutputExecOptions(),
       cwd: directory || process.cwd(),
     }));
   } catch {
@@ -554,22 +556,34 @@ async function querySqliteJson(sql) {
   const sqlitePath = await resolveSqlitePath();
   let stdout;
   try {
-    ({ stdout } = await execFile(sqlitePath, ["-json", dbPath, ".timeout 3000", sql]));
+    ({ stdout } = await execFile(
+      sqlitePath,
+      ["-json", dbPath, ".timeout 3000", sql],
+      largeOutputExecOptions(),
+    ));
   } catch (error) {
     if (!shouldFallbackSqliteFormat(error)) throw error;
-    ({ stdout } = await execFile(sqlitePath, [
-      "-header",
-      "-separator",
-      "\t",
-      dbPath,
-      ".timeout 3000",
-      sql,
-    ]));
+    ({ stdout } = await execFile(
+      sqlitePath,
+      [
+        "-header",
+        "-separator",
+        "\t",
+        dbPath,
+        ".timeout 3000",
+        sql,
+      ],
+      largeOutputExecOptions(),
+    ));
     return parseSqliteTabularJson(String(stdout || ""));
   }
   const trimmed = String(stdout || "").trim();
   if (!trimmed) return [];
   return parseJsonValue(trimmed, []);
+}
+
+function largeOutputExecOptions() {
+  return { maxBuffer: LARGE_OUTPUT_MAX_BUFFER };
 }
 
 function isMissingSessionTableError(error) {
@@ -676,6 +690,7 @@ function getSqlitePathForTesting() {
 function __testOnly() {
   return {
     exportSessionByID,
+    largeOutputExecOptions,
     parseOpencodeExport,
     normalizeExportedSnapshot,
     parseSqliteTabularJson,

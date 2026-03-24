@@ -7,7 +7,13 @@ import test from "node:test";
 import OpencodeSessionLogPlugin from "../index.js";
 
 const { syncOpencodeSessionLogSnapshot, buildSnapshotFromClient } = OpencodeSessionLogPlugin;
-const { parseSqliteTabularJson, shouldFallbackSqliteFormat, parseOpencodeExport, normalizeExportedSnapshot } =
+const {
+  largeOutputExecOptions,
+  parseSqliteTabularJson,
+  shouldFallbackSqliteFormat,
+  parseOpencodeExport,
+  normalizeExportedSnapshot,
+} =
   OpencodeSessionLogPlugin.__testOnly();
 
 function makeSnapshot(workspace, overrides = {}) {
@@ -498,6 +504,12 @@ test("parses legacy sqlite tabular output and detects -json fallback", () => {
     true,
   );
   assert.equal(shouldFallbackSqliteFormat({ stderr: "another error" }), false);
+});
+
+test("uses a larger maxBuffer for export and sqlite fallbacks", () => {
+  assert.deepEqual(largeOutputExecOptions(), {
+    maxBuffer: 64 * 1024 * 1024,
+  });
 });
 
 test("parses opencode export output with human prefix", () => {

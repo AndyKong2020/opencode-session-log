@@ -53,8 +53,8 @@ This repo is configured to publish from GitHub Actions. You do not need your own
 The publish workflow runs when you push a tag like:
 
 ```bash
-git tag v0.1.6
-git push origin v0.1.6
+git tag v0.1.7
+git push origin v0.1.7
 ```
 
 Before the publish step, GitHub Actions will:
@@ -78,7 +78,7 @@ The token should be an npm publish token with permission to publish this package
 3. Create and push a matching tag:
 
 ```bash
-git tag v0.1.6
+git tag v0.1.7
 git push origin main --tags
 ```
 
